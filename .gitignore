@@ -9,5 +9,11 @@
 /out.mp4
 /smoke/
 
+# demo renders stay out of the repo (large binary, GitHub caps files at 100 MB)
+/demo/**/*.mp4
+
 # macOS
 .DS_Store
+
+# workbuddy
+/.workbuddy/
