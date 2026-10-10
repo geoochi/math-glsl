@@ -74,7 +74,19 @@ ENCODER=h264_videotoolbox ENCODE_ARGS="-q:v 60" ./render_glsl   # 硬件编码
 
 ## CI
 
-GitHub Actions 在 macOS / Ubuntu / Windows 三个 runner 上编译三个平台后端，并各自尝试跑一条 1 秒的冒烟视频（无头 runner 没有真 GPU，渲染步骤是尽力而为，编译步骤是硬性要求）。产物在每次运行的 Artifacts 里。
+GitHub Actions 在三个 runner 上编译三个平台后端（编译是**硬性要求**），并各自尝试跑一条 1 秒冒烟视频。实测结果：
+
+| runner | 编译 | 渲染 |
+|---|---|---|
+| `ubuntu-latest` | ✅ EGL | ✅ llvmpipe 软件渲染（Mesa 4.5 core） |
+| `macos-latest` | ✅ CGL | ✅ Apple 软件渲染器（GL 4.1 core） |
+| `windows-latest` | ✅ WGL / MSVC | ❌ 云 VM 只有 GDI Generic 渲染器（GL 1.1），跑不了 4.1 core |
+
+渲染成功的 runner 会把视频传到 Artifacts，可以直接下载来验。
+
+CI 已经抓到过一个真实缺陷：macOS runner 上 `CGLChoosePixelFormat` 直接失败，因为代码里强制要求了 `kCGLPFAAccelerated`，而 VM 没有硬件加速的 GL 设备。现在改成先试加速、失败则退到软件渲染器——这个修复对无 GPU 的虚拟机和无头机器同样有用。
+
+> 小提示：`actions/checkout@v4` 与 `actions/upload-artifact@v4` 目前会打印 Node.js 20 弃用警告（会自动跑在 Node 24 上）。等它们各自发布 v5 后升级即可，不影响功能。
 
 ## License
 

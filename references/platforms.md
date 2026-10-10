@@ -26,6 +26,8 @@ gcc -O2 -Wall -Wextra -o render_glsl.exe src\render_glsl.c -lopengl32 -lgdi32 -l
 - OpenGL 自 10.14 起被标记弃用：源码里已 `#define GL_SILENCE_DEPRECATION 1`。
 - 驱动本身是 Metal 实现的（`glGetString(GL_VERSION)` 返回形如 `4.1 Metal - 91.7`），所以 GL 版本上限就是 4.1。
 - 上下文创建不需要窗口，`CGLCreateContext` 之后直接 `CGLSetCurrentContext` 即可，适合 CI。
+- **`kCGLPFAAccelerated` 不能强求**：虚拟机、CI 机器、无头服务器上常常没有硬件加速的 GL 设备，一旦要求加速，`CGLChoosePixelFormat` 会直接失败。源码里是先试加速、失败后去掉该属性重试，退到 Apple 的软件渲染器（同样支持 GL 4.1 core）。
+  实测：GitHub 的 `macos-latest` runner 走的就是这条软件回退路径。
 
 ## Windows / WGL
 

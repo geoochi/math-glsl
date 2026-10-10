@@ -57,18 +57,33 @@
 
   // macOS has no EGL/WGL, so the platform layer is CGL. A context without a
   // drawable is legal here; we render into an FBO.
+  //
+  // kCGLPFAAccelerated is tried first, then dropped: VMs, CI machines and
+  // headless boxes often have no accelerated GL device, and demanding one makes
+  // CGLChoosePixelFormat fail outright. Without it we get Apple's software
+  // renderer, which still does GL 4.1 core.
   static int plat_init(plat_ctx_t *out) {
-      CGLPixelFormatAttribute attrs[] = {
+      CGLPixelFormatAttribute accel[] = {
           kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core,
           kCGLPFAAccelerated,
           kCGLPFAColorSize, (CGLPixelFormatAttribute)24,
           (CGLPixelFormatAttribute)0
       };
-      CGLPixelFormatObj pix;
+      CGLPixelFormatAttribute soft[] = {
+          kCGLPFAOpenGLProfile, (CGLPixelFormatAttribute)kCGLOGLPVersion_GL4_Core,
+          kCGLPFAColorSize, (CGLPixelFormatAttribute)24,
+          (CGLPixelFormatAttribute)0
+      };
+      CGLPixelFormatObj pix = NULL;
       GLint npix = 0;
-      if (CGLChoosePixelFormat(attrs, &pix, &npix) != kCGLNoError || !pix) {
-          fprintf(stderr, "[gl] CGLChoosePixelFormat failed\n");
-          return 0;
+      if (CGLChoosePixelFormat(accel, &pix, &npix) != kCGLNoError || !pix) {
+          pix = NULL;
+          if (CGLChoosePixelFormat(soft, &pix, &npix) != kCGLNoError || !pix) {
+              fprintf(stderr, "[gl] CGLChoosePixelFormat failed "
+                              "(no accelerated and no software GL renderer?)\n");
+              return 0;
+          }
+          fprintf(stderr, "[gl] no accelerated GL device, using the software renderer\n");
       }
       if (CGLCreateContext(pix, NULL, out) != kCGLNoError) {
           fprintf(stderr, "[gl] CGLCreateContext failed\n");
