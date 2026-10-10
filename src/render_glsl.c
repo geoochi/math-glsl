@@ -25,16 +25,23 @@
 //    ./render_glsl out/sine.mp4 1920 1080 60 10
 //    SHADER=demo/wave/wave.glsl ./render_glsl wave.mp4    # any shader, #include works
 //    BITDEPTH=8 ./render_glsl               # force 8-bit if the box cannot do 10
+//    HWENC=0 ./render_glsl                  # disable hardware encoding (default: auto)
 //    NO_ENCODE=1 ./render_glsl x.mp4        # pipe to /dev/null: isolates encoder cost
 //    FFMPEG=/opt/homebrew/bin/ffmpeg ./render_glsl        # ffmpeg binary (not codec)
-//    ENCODER=h264_videotoolbox ENCODE_ARGS="-q:v 60" ./render_glsl   # hardware encode
+//    ENCODER=libx265 ENCODE_ARGS="-crf 18" ./render_glsl  # pick the encoder yourself
+//
+//  Encoder: the platform's hardware encoder is probed first (hevc_videotoolbox
+//  on macOS, hevc_nvenc / hevc_qsv / hevc_mf on Windows, hevc_nvenc / hevc_qsv
+//  on Linux) and libx264 is the fallback. Only 10-bit-capable encoders are
+//  considered when 10-bit was requested -- Apple's hardware H.264 silently
+//  produces 8-bit, which would quietly break that guarantee.
 //
 //  Colour pipeline: R10G10B10A2 renderbuffer -> glReadPixels as
 //  GL_UNSIGNED_INT_2_10_10_10_REV (packed 32-bit) -> ffmpeg x2bgr10le ->
-//  libx264 -profile:v high10 / yuv420p10le. If the driver cannot render
-//  R10G10B10A2 we drop to 8-bit automatically. (x2bgr10le, not x2rgb10le: that
-//  GL type packs red into the LOW 10 bits, so the word reads as BGR from the
-//  top. Verified by sampling pixels out of the encoded file.)
+//  libx264 -profile:v high10 / yuv420p10le (or hevc_videotoolbox / p010le).
+//  If the driver cannot render R10G10B10A2 we drop to 8-bit automatically.
+//  (x2bgr10le, not x2rgb10le: that GL type packs red into the LOW 10 bits, so
+//  the word reads as BGR from the top. Verified by sampling pixels.)
 //
 //  Requires ffmpeg on PATH (that is the only external dependency).
 // ============================================================================
@@ -521,6 +528,78 @@ static void ensure_parent_dir(const char *path) {
 }
 
 /* ==========================================================================
+ *  2b. ENCODER SELECTION
+ *
+ *  Software x264 burns a lot of CPU: encoding 2 s of 4K 10-bit measured 39.6 s
+ *  of CPU time (5.9 s wall, all cores) versus 1.6 s for the hardware HEVC
+ *  encoder -- a 25x cut -- and on motion content it is ~30% faster wall-clock
+ *  end to end (3.64 s -> 2.60 s).
+ *
+ *  So: try the platform's hardware encoders first, each with a throwaway
+ *  three-frame probe, and fall back to libx264. Notes:
+ *    - only 10-bit-capable hardware encoders are considered when 10-bit output
+ *      was asked for. Apple's hardware H.264 encoder silently produces 8-bit,
+ *      which would quietly break the 10-bit guarantee.
+ *    - ENCODER=<name> skips the probing entirely; HWENC=0 disables it.
+ * ========================================================================== */
+
+typedef struct {
+    const char *enc;        /* ffmpeg encoder name */
+    const char *pix10;      /* output pixel format in 10-bit mode */
+    const char *pix8;
+    const char *args10;     /* quality/profile flags */
+    const char *args8;
+} enc_cand_t;
+
+#if defined(__APPLE__)
+  static const enc_cand_t HW_CANDS[] = {
+      { "hevc_videotoolbox", "p010le",  "yuv420p", "-q:v 60 -tag:v hvc1", "-q:v 60" },
+      /* Apple's hardware H.264 encoder is 8-bit only, so it is skipped
+         automatically whenever 10-bit output was requested. */
+      { "h264_videotoolbox", "yuv420p", "yuv420p", "-q:v 60", "-q:v 60" },
+  };
+#elif defined(_WIN32)
+  static const enc_cand_t HW_CANDS[] = {
+      { "hevc_nvenc", "p010le",   "yuv420p", "-cq 20 -tag:v hvc1", "-cq 20" },
+      { "hevc_qsv",   "p010le",   "yuv420p", "-global_quality 20 -tag:v hvc1", "-global_quality 20" },
+      { "hevc_mf",    "p010le",   "yuv420p", "-q:v 60 -tag:v hvc1", "-q:v 60" },
+      { "h264_nvenc", "yuv420p",  "yuv420p", "-cq 20", "-cq 20" },
+      { "h264_qsv",   "yuv420p",  "yuv420p", "-global_quality 20", "-global_quality 20" },
+  };
+#else
+  static const enc_cand_t HW_CANDS[] = {
+      { "hevc_nvenc", "p010le",   "yuv420p", "-cq 20 -tag:v hvc1", "-cq 20" },
+      { "hevc_qsv",   "p010le",   "yuv420p", "-global_quality 20 -tag:v hvc1", "-global_quality 20" },
+      { "h264_nvenc", "yuv420p",  "yuv420p", "-cq 20", "-cq 20" },
+      { "h264_qsv",   "yuv420p",  "yuv420p", "-global_quality 20", "-global_quality 20" },
+  };
+#endif
+
+/* "10-bit capable" == its 10-bit and 8-bit pixel formats differ, i.e. the
+   encoder really is going to carry 10 bits rather than falling back to 8. */
+static int cand_is_ten_bit(const enc_cand_t *c) {
+    return strcmp(c->pix10, c->pix8) != 0;
+}
+
+/* Encode three 128x128 frames into the null muxer. Cheap, and it tests the
+   actual pipeline (rawvideo in, that exact encoder, those exact flags) rather
+   than just asking ffmpeg whether the encoder exists. */
+static int probe_encoder(const char *ffmpeg_bin, const enc_cand_t *c, int ten_bit) {
+    char cmd[1024];
+    snprintf(cmd, sizeof cmd,
+             "%s -hide_banner -loglevel error -f rawvideo -pix_fmt rgb24 "
+             "-s 128x128 -r 30 -i - -frames:v 3 -c:v %s -pix_fmt %s %s -f null -",
+             ffmpeg_bin, c->enc, ten_bit ? c->pix10 : c->pix8,
+             ten_bit ? c->args10 : c->args8);
+    FILE *p = POPEN(cmd);
+    if (!p) return 0;
+    static unsigned char zeros[128 * 128 * 3];
+    for (int i = 0; i < 3; i++)
+        if (fwrite(zeros, 1, sizeof zeros, p) != sizeof zeros) break;
+    return PCLOSE(p) == 0;
+}
+
+/* ==========================================================================
  *  3. THE RENDERER -- identical on all three platforms
  * ========================================================================== */
 
@@ -641,27 +720,53 @@ int main(int argc, char **argv) {
             snprintf(cmd, sizeof cmd, "cat > /dev/null");
         #endif
     } else {
-        const char *enc   = getenv("FFMPEG")  ? getenv("FFMPEG")  : "ffmpeg";
-        const char *codec = getenv("ENCODER") ? getenv("ENCODER") : "libx264";
-        /* 10-bit goes in as x2bgr10le; x264 needs -profile:v high10 to accept
-           yuv420p10le. Both are skipped when the encoder is overridden, since
-           hardware encoders take different flags (see ENCODE_ARGS).
-           NB the format is the *bgr* one: GL_UNSIGNED_INT_2_10_10_10_REV puts R
-           in the low 10 bits, so the packed word reads as BGR from the top.
-           x2rgb10le would swap red and blue -- verified by sampling pixels, not
-           by reading the spec. */
-        const char *in_pix  = ten_bit ? "x2bgr10le"   : "rgb24";
-        const char *out_pix = ten_bit ? "yuv420p10le" : "yuv420p";
-        const char *profile = (ten_bit && !getenv("ENCODER")) ? " -profile:v high10" : "";
-        /* CRF is an x264/x265 thing; hardware encoders want -q:v instead, so
-           the quality flags are overridable too. */
-        const char *qual  = getenv("ENCODE_ARGS") ? getenv("ENCODE_ARGS") : "-crf 16 -preset slow";
+        const char *ffmpeg_bin = getenv("FFMPEG") ? getenv("FFMPEG") : "ffmpeg";
+        /* 10-bit frames go in as x2bgr10le. NB the *bgr* one:
+           GL_UNSIGNED_INT_2_10_10_10_REV puts red in the low 10 bits, so the
+           packed word reads BGR from the top; x2rgb10le would swap red and blue
+           (verified by sampling pixels, not by reading the spec). */
+        const char *in_pix = ten_bit ? "x2bgr10le" : "rgb24";
+        const char *codec = NULL, *qual = NULL, *out_pix = NULL, *tag = "";
+        int hw = 0;
+
+        if (getenv("ENCODER")) {
+            /* explicit choice: respect it, only fill in quality defaults */
+            codec = getenv("ENCODER");
+            qual = getenv("ENCODE_ARGS") ? getenv("ENCODE_ARGS")
+                 : (strstr(codec, "lib") ? "-crf 16 -preset slow" : "-q:v 60");
+        } else {
+            if (!(getenv("HWENC") && atoi(getenv("HWENC")) == 0)) {
+                for (unsigned i = 0; i < sizeof HW_CANDS / sizeof HW_CANDS[0]; i++) {
+                    const enc_cand_t *c = &HW_CANDS[i];
+                    if (ten_bit && !cand_is_ten_bit(c)) continue;  /* would drop to 8-bit */
+                    if (probe_encoder(ffmpeg_bin, c, ten_bit)) {
+                        codec   = c->enc;
+                        qual    = ten_bit ? c->args10 : c->args8;
+                        out_pix = ten_bit ? c->pix10  : c->pix8;
+                        hw = 1;
+                        break;
+                    }
+                }
+            }
+            if (!codec) {                       /* software fallback */
+                codec = "libx264";
+                qual  = "-crf 16 -preset slow";
+            }
+        }
+        if (!out_pix) {
+            out_pix = ten_bit ? "yuv420p10le" : "yuv420p";
+            /* CRF is an x264/x265 thing; x264 also needs -profile:v high10
+               before it will accept 10-bit input. */
+            if (ten_bit && strncmp(codec, "libx264", 7) == 0) tag = " -profile:v high10";
+        }
+        printf("[gl] encoder: %s  (%s)\n", codec, hw ? "hardware" : "software");
+
         snprintf(cmd, sizeof cmd,
                  "%s -hide_banner -loglevel error -y "
                  "-f rawvideo -pix_fmt %s -s %dx%d -r %d -i - "
-                 "-vf vflip -c:v %s %s%s "
-                 "-pix_fmt %s -movflags +faststart \"%s\"",
-                 enc, in_pix, W, H, fps, codec, qual, profile, out_pix, out_path);
+                 "-vf vflip -c:v %s -pix_fmt %s %s%s "
+                 "-movflags +faststart \"%s\"",
+                 ffmpeg_bin, in_pix, W, H, fps, codec, out_pix, qual, tag, out_path);
     }
     FILE *pipe = POPEN(cmd);
     if (!pipe) { fprintf(stderr, "[gl] cannot start encoder: %s\n", cmd); return 1; }

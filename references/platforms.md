@@ -79,3 +79,28 @@ ffmpeg -pix_fmt x2bgr10le -c:v libx264 -profile:v high10 -pix_fmt yuv420p10le
 3. **`GL_RGB10_A2` 是 core profile 里唯一保证可作颜色缓冲的 10bit 布局**（R10G10B10A2）。老驱动或软件渲染可能不支持，此时应退回 `GL_RGB8` + `rgb24` + `yuv420p`。本项目是自动降级的，并会打印一行提示。
 
 另外 4:2:0 色度抽样会**明显削弱细线的颜色**（1–2 像素宽的亮线会被去饱和、看起来偏灰）。这是 H.264 的固有特性，不是通道顺序错了——判断通道顺序要看**大面积色块**，不要看细线。
+
+## 硬件编码器（各平台候选）
+
+启动时用一次 3 帧、128×128 的试探编码逐个探测，成功即用，全失败则回退 `libx264`。探测本身约 180 ms（ffmpeg 启动 35 ms + 硬件会话初始化 ~145 ms），`HWENC=0` 可跳过。
+
+| 平台 | 候选（按顺序） | 10bit 输出像素格式 |
+|---|---|---|
+| macOS | `hevc_videotoolbox` | `p010le` |
+| Windows | `hevc_nvenc` → `hevc_qsv` → `hevc_mf` | `p010le` |
+| Linux | `hevc_nvenc` → `hevc_qsv` | `p010le` |
+
+**必须在 10bit 模式下跳过硬件 H.264。** Apple 的硬件 H.264 编码器只支持 8bit，而且**不报错**：给它 `yuv420p10le` 它会输出 `yuv420p`，profile 从 High 10 变成 High。实测数据：
+
+| | libx264 High 10（软件） | h264_videotoolbox | hevc_videotoolbox |
+|---|---|---|---|
+| 输出 profile / pix_fmt | High 10 / yuv420p10le | **High / yuv420p（悄悄丢了 10bit）** | Main 10 / yuv420p10le |
+| CPU 时间（4K 120 帧） | 39.6 s | 0.8 s | 1.6 s |
+| 墙钟（端到端，有运动内容） | 30.4 ms/帧 | — | **21.7 ms/帧** |
+
+所以候选表里给每个编码器同时记了 `pix10` 和 `pix8`：**两者相同就说明它在 10bit 模式下会降级，于是被自动跳过**（`cand_is_ten_bit()` 就是干这个的，不用硬编码"哪些编码器支持 10bit"这种会过期的知识）。
+
+两个实务要点：
+
+- **HEVC 必须加 `-tag:v hvc1`**，否则写进 MP4 的是 `hev1`，QuickTime / Safari 不认。
+- 硬件编码省的是 **CPU**（39.6 s → 1.6 s），不一定是墙钟——4K 下瓶颈往往在"把 33 MB/帧 喂进编码器"这件事上（纯管道上限约 5.9 GB/s，见 `NO_ENCODE=1` 测试）。有运动的内容上硬件快约 29%，静止画面则几乎没有差别。

@@ -66,16 +66,34 @@ SHADER=demo/wave/wave.glsl ./render_glsl demo/wave/wave.mp4 3840 2160 60 5
 |---|---|
 | `SHADER` | 换着色器，例如 `SHADER=demo/wave/wave.glsl` |
 | `BITDEPTH=8` | 强制 8bit（默认 10bit；驱动不支持 R10G10B10A2 时会自动降级） |
+| `HWENC=0` | 关掉硬件编码，强制软件编码 |
 | `NO_ENCODE=1` | 管道接 `/dev/null`，用来判断耗时里有多少是编码器反压 |
 | `FFMPEG` | ffmpeg 可执行文件路径 |
-| `ENCODER` | 编码器，默认 `libx264` |
-| `ENCODE_ARGS` | 质量参数，默认 `-crf 16 -preset slow`；硬件编码器改成 `-q:v 60` |
+| `ENCODER` | 指定编码器（跳过自动探测），默认自动选 |
+| `ENCODE_ARGS` | 质量参数，默认软件 `-crf 16 -preset slow`、硬件 `-q:v 60` |
 
-硬件编码示例（快很多，10bit 需要编码器支持）：
+## 编码器：默认自动选硬件
 
-```bash
-ENCODER=hevc_videotoolbox ENCODE_ARGS="-q:v 60" ./render_glsl out.mp4 3840 2160 60 2
-```
+启动时会用一次 3 帧的试探编码探测平台的硬件编码器，成功就用它，失败回退 `libx264`。**探测会带来约 0.2–0.3 秒的启动开销**（ffmpeg 启动 + 硬件编码器会话初始化），短片段可以用 `HWENC=0` 跳过。
+
+候选顺序（只考虑**支持 10bit** 的硬件编码器，因为 10bit 是默认）：
+
+| 平台 | 候选 |
+|---|---|
+| macOS | `hevc_videotoolbox` |
+| Windows | `hevc_nvenc` → `hevc_qsv` → `hevc_mf` |
+| Linux | `hevc_nvenc` → `hevc_qsv` |
+
+**为什么不能直接用硬件 H.264**：Apple 的硬件 H.264 编码器只输出 8bit——实测 `h264_videotoolbox` 会**静默**把 `yuv420p10le` 降成 `yuv420p`（profile 从 High 10 变成 High），10bit 保证会被悄悄破坏。所以 10bit 模式下它被自动跳过。（8bit 模式下它是候选之一。）
+
+实测对比（Apple M1 Pro，4K60 10bit，wave demo 内容）：
+
+| 编码器 | 整帧 | 输出 |
+|---|---|---|
+| `libx264 -profile:v high10`（软件） | 30.4 ms | H.264 High 10 |
+| `hevc_videotoolbox`（硬件） | **21.7 ms** | HEVC Main 10 |
+
+**快约 29%**，而且 CPU 时间从 39.6 s 降到 1.6 s（省 25 倍）。代价是 HEVC 的兼容性不如 H.264——演示视频 `demo/wave/wave.mp4` 因此用 `HWENC=0` 渲染成 H.264，方便任何播放器直接打开。
 
 ## 环境要求
 
@@ -110,8 +128,14 @@ ENCODER=hevc_videotoolbox ENCODE_ARGS="-q:v 60" ./render_glsl out.mp4 3840 2160 
 
 ## 性能
 
-4K 60fps 一帧（Apple M1 Pro，10bit）：GPU 着色 **3.4 ms**、`glReadPixels` **3.3 ms**、H.264 编码 **14.7 ms**，整帧约 **25 ms**。
-注意 **4K 下编码成了绝对瓶颈（约 60%）**——想快就换硬件编码，而不是动着色器。
+4K60 10bit 一帧（Apple M1 Pro）：GPU 着色 **3.4 ms**、`glReadPixels` **3.3 ms**、编码 **12–16 ms**，整帧 22–30 ms。
+
+两点值得注意：
+
+1. **4K 下瓶颈是"把 33 MB 一帧搬进编码器"这件事本身。** 用一个纯管道容量测试（`NO_ENCODE=1`，管道接 `cat > /dev/null`）量到光写就要 **5.6 ms/帧**，也就是 ~5.9 GB/s 的上限。所以硬件编码器再快也快不过喂数据的速度——它的价值主要体现在**省 CPU**（39.6 s → 1.6 s），以及在有运动的内容上快约 29%。
+2. **同一套代码在不同内容上表现差很多**：默认的空坐标系几乎是静止画面，软件编码只要 12.2 ms/帧，硬件编码毫无优势；换成有运动的 wave demo，软件涨到 16.1 ms 而硬件只需 11.4 ms。
+
+想再快，顺序是：换硬件编码 → 少读字节（非必要不上 10bit）→ 绕开管道（进程内编码）。
 
 ## 作为 AI skill 使用
 

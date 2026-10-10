@@ -12,7 +12,7 @@
 > 跟着波形上下移动，外面套一个不断扩散并淡出的圆环。
 > 视野宽度 9 个数学单位，曲线半宽 1.6 像素。
 >
-> **规格**：3840×2160，60fps，10bit（H.264 High 10 / yuv420p10le），时长 5 秒。
+> **规格**：3840×2160，60fps，10bit，时长 5 秒。
 
 ---
 
@@ -21,7 +21,9 @@
 ```bash
 git clone https://github.com/geoochi/math-glsl && cd math-glsl
 make
-SHADER=demo/wave/wave.glsl ./render_glsl demo/wave/wave.mp4 3840 2160 60 5
+# HWENC=0：这个仓库里存的演示视频用软件 H.264 编，兼容性最好，任何播放器都能直接打开。
+# 去掉 HWENC=0 就会走默认的硬件编码（macOS 上是 HEVC Main 10，更快但兼容性略差）。
+HWENC=0 SHADER=demo/wave/wave.glsl ./render_glsl demo/wave/wave.mp4 3840 2160 60 5
 ```
 
 ## 产出
