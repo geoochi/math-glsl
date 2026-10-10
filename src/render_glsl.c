@@ -21,12 +21,20 @@
 //             mingw: gcc -O2 -o render_glsl.exe render_glsl.c -lopengl32 -lgdi32 -luser32
 //
 //  Usage
-//    ./render_glsl                          # 5 s of 1920x1080@60 into ./wave.mp4
-//    ./render_glsl out/sine.mp4 3840 2160 120 10
-//    SHADER=shaders/my.glsl ./render_glsl my.mp4 1280 720 30 2
+//    ./render_glsl                          # DEFAULT: 4K 60fps 10-bit, 2 s -> ./out.mp4
+//    ./render_glsl out/sine.mp4 1920 1080 60 10
+//    SHADER=demo/wave/wave.glsl ./render_glsl wave.mp4    # any shader, #include works
+//    BITDEPTH=8 ./render_glsl               # force 8-bit if the box cannot do 10
 //    NO_ENCODE=1 ./render_glsl x.mp4        # pipe to /dev/null: isolates encoder cost
-//    FFMPEG=/opt/homebrew/bin/ffmpeg ./render_glsl       # ffmpeg binary (not codec)
+//    FFMPEG=/opt/homebrew/bin/ffmpeg ./render_glsl        # ffmpeg binary (not codec)
 //    ENCODER=h264_videotoolbox ENCODE_ARGS="-q:v 60" ./render_glsl   # hardware encode
+//
+//  Colour pipeline: R10G10B10A2 renderbuffer -> glReadPixels as
+//  GL_UNSIGNED_INT_2_10_10_10_REV (packed 32-bit) -> ffmpeg x2bgr10le ->
+//  libx264 -profile:v high10 / yuv420p10le. If the driver cannot render
+//  R10G10B10A2 we drop to 8-bit automatically. (x2bgr10le, not x2rgb10le: that
+//  GL type packs red into the LOW 10 bits, so the word reads as BGR from the
+//  top. Verified by sampling pixels out of the encoded file.)
 //
 //  Requires ffmpeg on PATH (that is the only external dependency).
 // ============================================================================
@@ -120,6 +128,8 @@
   #define GL_COLOR_ATTACHMENT0      0x8CE0
   #define GL_FRAMEBUFFER_COMPLETE   0x8CD5
   #define GL_RGB8                   0x8051
+  #define GL_RGB10_A2               0x8059
+  #define GL_UNSIGNED_INT_2_10_10_10_REV 0x8368
 
   #define GL_FUNCS(X)                                                                     \
     X(GLuint,   glCreateShader,          (GLenum))                                        \
@@ -396,14 +406,97 @@ static int file_exists(const char *p) {
     return 0;
 }
 
+/* --- a tiny #include preprocessor -----------------------------------------
+ * GLSL has no #include directive in core 4.1. Since the whole point of the
+ * default shader is "empty coordinate system + your own logic", being able to
+ * write   #include "lib.glsl"   and keep the two in separate files is worth the
+ * ~50 lines below. Paths are resolved relative to the *including* file.
+ * ------------------------------------------------------------------------ */
+
+typedef struct { char *p; size_t len, cap; } strbuf_t;
+
+static void sb_add(strbuf_t *b, const char *s, size_t n) {
+    if (b->len + n + 1 > b->cap) {
+        while (b->len + n + 1 > b->cap) b->cap = b->cap ? b->cap * 2 : 4096;
+        b->p = realloc(b->p, b->cap);
+        if (!b->p) { fprintf(stderr, "[gl] out of memory\n"); exit(1); }
+    }
+    memcpy(b->p + b->len, s, n);
+    b->len += n;
+    b->p[b->len] = 0;
+}
+
+/* "/a/b/c.glsl" -> "/a/b" ; "c.glsl" -> "." */
+static void dir_of(const char *path, char *out, size_t n) {
+    const char *slash = strrchr(path, '/');
+#if defined(_WIN32)
+    const char *bs = strrchr(path, '\\');
+    if (bs && (!slash || bs > slash)) slash = bs;
+#endif
+    if (!slash) { snprintf(out, n, "."); return; }
+    size_t k = (size_t)(slash - path);
+    if (k == 0) k = 1;                       /* keep the leading '/' */
+    if (k >= n) k = n - 1;
+    memcpy(out, path, k);
+    out[k] = 0;
+}
+
+static char *load_shader_file(const char *path, int depth) {
+    if (depth > 8) { fprintf(stderr, "[gl] #include nested too deep at %s\n", path); exit(1); }
+    char *src = read_file(path);
+
+    char dir[1024];
+    dir_of(path, dir, sizeof dir);
+
+    strbuf_t out = {0};
+    char *line = src;
+    while (*line) {
+        char *eol = strchr(line, '\n');
+        size_t linelen = eol ? (size_t)(eol - line) + 1 : strlen(line);
+
+        /* match: optional spaces, then #include "file" (with or without space) */
+        char *q = line;
+        while (q < line + linelen && (*q == ' ' || *q == '\t')) q++;
+        if (q + 9 < line + linelen && strncmp(q, "#include", 8) == 0) {
+            char *r = q + 8;
+            while (r < line + linelen && (*r == ' ' || *r == '\t')) r++;
+            if (*r == '"') {
+                char *end = strchr(r + 1, '"');
+                if (end) {
+                    char name[512];
+                    size_t k = (size_t)(end - r - 1);
+                    if (k >= sizeof name) k = sizeof name - 1;
+                    memcpy(name, r + 1, k);
+                    name[k] = 0;
+                    char full[1200];
+                    if (name[0] == '/' || (name[0] && name[1] == ':'))
+                        snprintf(full, sizeof full, "%s", name);
+                    else
+                        snprintf(full, sizeof full, "%s/%s", dir, name);
+                    char *inc = load_shader_file(full, depth + 1);
+                    sb_add(&out, inc, strlen(inc));
+                    free(inc);
+                    line += linelen;
+                    continue;
+                }
+            }
+        }
+        sb_add(&out, line, linelen);
+        line += linelen;
+    }
+    free(src);
+    if (!out.p) { out.p = malloc(1); out.p[0] = 0; }
+    return out.p;
+}
+
 /* So `./build/render_glsl` works from the repo root or from a build dir. */
 static const char *find_shader(const char *from_env) {
-    static const char *cands[] = { NULL, "shaders/wave.glsl",
-                                   "../shaders/wave.glsl", "wave.glsl" };
+    static const char *cands[] = { NULL, "shaders/axes.glsl",
+                                   "../shaders/axes.glsl", "axes.glsl" };
     if (from_env) return from_env;
     for (unsigned i = 1; i < sizeof cands / sizeof cands[0]; i++)
         if (file_exists(cands[i])) return cands[i];
-    return "shaders/wave.glsl";          /* miss -> read_file explains it */
+    return "shaders/axes.glsl";          /* miss -> read_file explains it */
 }
 
 /* ffmpeg does not create the output directory, and a first-run failure there
@@ -460,12 +553,14 @@ static GLuint compile(GLenum type, const char *src, const char *label) {
 }
 
 int main(int argc, char **argv) {
-    const char *out_path = argc > 1 ? argv[1] : "wave.mp4";
-    int    W   = argc > 2 ? atoi(argv[2]) : 1920;
-    int    H   = argc > 3 ? atoi(argv[3]) : 1080;
-    int    fps = argc > 4 ? atoi(argv[4]) : 60;
-    double dur = argc > 5 ? atof(argv[5]) : 5.0;
+    const char *out_path = argc > 1 ? argv[1] : "out.mp4";
+    int    W   = argc > 2 ? atoi(argv[2]) : 3840;    /* default: 4K */
+    int    H   = argc > 3 ? atoi(argv[3]) : 2160;
+    int    fps = argc > 4 ? atoi(argv[4]) : 60;      /* default: 60 fps */
+    double dur = argc > 5 ? atof(argv[5]) : 2.0;     /* default: 2 s */
     const char *shader_path = find_shader(getenv("SHADER"));
+    int ten_bit = 1;
+    { const char *bd = getenv("BITDEPTH"); if (bd && atoi(bd) == 8) ten_bit = 0; }
 
     ensure_parent_dir(out_path);
 
@@ -477,7 +572,7 @@ int main(int argc, char **argv) {
                             (const char *)glGetString(GL_VERSION));
 
     /* --- compile the shader: shared body + a platform-agnostic header ------ */
-    char *body = read_file(shader_path);
+    char *body = load_shader_file(shader_path, 0);   /* resolves #include */
     size_t len = strlen(FRAG_HEADER) + strlen(body) + 1;
     char *frag_src = malloc(len);
     strcpy(frag_src, FRAG_HEADER);
@@ -499,18 +594,30 @@ int main(int argc, char **argv) {
     }
     glUseProgram(prog);
 
-    /* --- offscreen target: no window is ever shown ------------------------- */
+    /* --- offscreen target: no window is ever shown -------------------------
+     * 10-bit by default. R10G10B10A2 is the only 10-bit-per-channel layout that
+     * core profile guarantees to be colour-renderable, and it reads back as one
+     * packed 32-bit word per pixel (GL_UNSIGNED_INT_2_10_10_10_REV). If the
+     * driver refuses the format we fall back to plain 8-bit RGB. */
     GLuint fbo, rbo;
     glGenFramebuffers(1, &fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, fbo);
     glGenRenderbuffers(1, &rbo);
     glBindRenderbuffer(GL_RENDERBUFFER, rbo);
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_RGB8, W, H);
+    glRenderbufferStorage(GL_RENDERBUFFER, ten_bit ? GL_RGB10_A2 : GL_RGB8, W, H);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, rbo);
+    if (ten_bit && glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr, "[gl] GL_RGB10_A2 is not renderable here, falling back to 8-bit\n");
+        ten_bit = 0;
+        glRenderbufferStorage(GL_RENDERBUFFER, GL_RGB8, W, H);
+    }
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
         fprintf(stderr, "[gl] framebuffer incomplete\n");
         return 1;
     }
+    int bpp = ten_bit ? 4 : 3;
+    printf("[gl] colour: %s\n", ten_bit ? "10-bit  R10G10B10A2 -> x2bgr10le"
+                                        : "8-bit   RGB8 -> rgb24");
     glViewport(0, 0, W, H);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);   /* RGB rows are 3*W bytes, may be odd */
 
@@ -536,20 +643,30 @@ int main(int argc, char **argv) {
     } else {
         const char *enc   = getenv("FFMPEG")  ? getenv("FFMPEG")  : "ffmpeg";
         const char *codec = getenv("ENCODER") ? getenv("ENCODER") : "libx264";
+        /* 10-bit goes in as x2bgr10le; x264 needs -profile:v high10 to accept
+           yuv420p10le. Both are skipped when the encoder is overridden, since
+           hardware encoders take different flags (see ENCODE_ARGS).
+           NB the format is the *bgr* one: GL_UNSIGNED_INT_2_10_10_10_REV puts R
+           in the low 10 bits, so the packed word reads as BGR from the top.
+           x2rgb10le would swap red and blue -- verified by sampling pixels, not
+           by reading the spec. */
+        const char *in_pix  = ten_bit ? "x2bgr10le"   : "rgb24";
+        const char *out_pix = ten_bit ? "yuv420p10le" : "yuv420p";
+        const char *profile = (ten_bit && !getenv("ENCODER")) ? " -profile:v high10" : "";
         /* CRF is an x264/x265 thing; hardware encoders want -q:v instead, so
            the quality flags are overridable too. */
         const char *qual  = getenv("ENCODE_ARGS") ? getenv("ENCODE_ARGS") : "-crf 16 -preset slow";
         snprintf(cmd, sizeof cmd,
                  "%s -hide_banner -loglevel error -y "
-                 "-f rawvideo -pix_fmt rgb24 -s %dx%d -r %d -i - "
-                 "-vf vflip -c:v %s %s "
-                 "-pix_fmt yuv420p -movflags +faststart \"%s\"",
-                 enc, W, H, fps, codec, qual, out_path);
+                 "-f rawvideo -pix_fmt %s -s %dx%d -r %d -i - "
+                 "-vf vflip -c:v %s %s%s "
+                 "-pix_fmt %s -movflags +faststart \"%s\"",
+                 enc, in_pix, W, H, fps, codec, qual, profile, out_pix, out_path);
     }
     FILE *pipe = POPEN(cmd);
     if (!pipe) { fprintf(stderr, "[gl] cannot start encoder: %s\n", cmd); return 1; }
 
-    unsigned char *px = malloc((size_t)W * H * 3);
+    unsigned char *px = malloc((size_t)W * H * bpp);
     double t_shade = 0, t_read = 0, t_pipe = 0;
     double wall0 = now_s();
 
@@ -561,9 +678,12 @@ int main(int argc, char **argv) {
         glDrawArrays(GL_TRIANGLES, 0, 3);
         glFinish();
         double b = now_s();
-        glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
+        if (ten_bit)
+            glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, px);
+        else
+            glReadPixels(0, 0, W, H, GL_RGB, GL_UNSIGNED_BYTE, px);
         double c = now_s();
-        fwrite(px, 1, (size_t)W * H * 3, pipe);
+        fwrite(px, 1, (size_t)W * H * bpp, pipe);
         double d = now_s();
 
         t_shade += b - a; t_read += c - b; t_pipe += d - c;

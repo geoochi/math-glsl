@@ -1,8 +1,21 @@
 # 写着色器时的注意事项
 
+## 组合方式：基础 + 你的逻辑
+
+本仓库的着色器分两层，这是推荐的使用姿势：
+
+- **`shaders/axes.glsl`** — 默认着色器，只画一个空的坐标系，并留出 `YOUR DRAWING GOES HERE` 区段。
+- **`shaders/lib.glsl`** — 可复用件（`toMath` / `strokeMask` / `coordinateSystem` / `heightRamp` / `vignette`）。纯函数，无全局状态，任何着色器都能包含。
+
+复制 `axes.glsl` → 改区段里的数学 → `SHADER=你的文件 ./render_glsl`。
+
+**渲染器自己实现了 `#include "..."`**（core GLSL 没有这个指令）：路径按**被包含文件**所在目录解析，所以 `demo/wave/wave.glsl` 里写 `#include "../../shaders/lib.glsl"`。嵌套深度上限 8 层。
+
+注意 GLSL 要求"先声明后使用"，且 `#include` 是**文本替换**，所以被包含的函数不能引用包含方稍后才定义的常量——需要的话通过参数传进去（`lib.glsl` 就是这么写的）。
+
 ## 正文契约
 
-`shaders/wave.glsl` **不含 `#version`**，只写正文和 `main()`。宿主负责加头：
+着色器**不含 `#version`**，只写正文和 `main()`。宿主负责加头：
 
 ```glsl
 #version 410 core

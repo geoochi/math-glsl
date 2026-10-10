@@ -59,5 +59,23 @@ sudo apt install ffmpeg      # Linux
 winget install ffmpeg        # Windows
 ```
 
-管道是 `raw RGB 帧 → ffmpeg -f rawvideo -pix_fmt rgb24 -s WxH -r fps -i - -vf vflip -c:v ...`。
+管道是 `raw 帧 → ffmpeg -f rawvideo -pix_fmt <格式> -s WxH -r fps -i - -vf vflip -c:v ...`。
 想摆脱 ffmpeg：macOS 用 AVFoundation，Windows 用 Media Foundation，Linux 用 libav* 直接调——但那就不再是"零依赖"了。
+
+## 10bit 色彩管线（跨平台通用的坑）
+
+```
+GL_RGB10_A2 渲染缓冲
+   ↓ glReadPixels(GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV)   每像素 4 字节
+   ↓ 管道
+ffmpeg -pix_fmt x2bgr10le -c:v libx264 -profile:v high10 -pix_fmt yuv420p10le
+```
+
+三个必须知道的点：
+
+1. **`GL_UNSIGNED_INT_2_10_10_10_REV` 把红色放在低 10 位。** 所以那个 32 位字从高位往低位读是 **B、G、R、A**。对应的 ffmpeg 输入格式是 **`x2bgr10le`**。
+   写成 `x2rgb10le` 会把红蓝对调——画面还能"看"，但颜色全错（青会变橙）。**这个只能靠采样像素值发现**：对着纯色背景量一点的 RGB，和设计值比对（本项目实测：设计背景 `(11,14,20)`，用错格式量到 `(18,13,10)`，改对后量到 `(10,13,18)`）。
+2. **x264 必须显式指定 `-profile:v high10`**，否则它不接受 `yuv420p10le` 输入。硬件编码器（videotoolbox / nvenc / qsv）不听这套参数，所以要单独覆盖 `ENCODE_ARGS`。
+3. **`GL_RGB10_A2` 是 core profile 里唯一保证可作颜色缓冲的 10bit 布局**（R10G10B10A2）。老驱动或软件渲染可能不支持，此时应退回 `GL_RGB8` + `rgb24` + `yuv420p`。本项目是自动降级的，并会打印一行提示。
+
+另外 4:2:0 色度抽样会**明显削弱细线的颜色**（1–2 像素宽的亮线会被去饱和、看起来偏灰）。这是 H.264 的固有特性，不是通道顺序错了——判断通道顺序要看**大面积色块**，不要看细线。
