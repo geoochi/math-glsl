@@ -1,0 +1,13 @@
+# build output
+/render_glsl
+/render_glsl.exe
+*.o
+*.obj
+*.exe
+
+# default output when run with no arguments
+/wave.mp4
+/smoke/
+
+# macOS
+.DS_Store

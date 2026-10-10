@@ -1,0 +1,97 @@
+name: build
+
+# Compile-verifies the three platform backends of src/render_glsl.c -- that is
+# the hard contract of this workflow. Each runner then attempts a 1-second
+# smoke render and checks it with ffprobe; those steps are best-effort because
+# CI machines have no real GPU (the Windows runner in particular only offers
+# the GDI Generic renderer, which tops out at OpenGL 1.1).
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # --- dependencies ------------------------------------------------------
+      # NOTE: the runner images do not ship ffmpeg, so install it explicitly.
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1-mesa-dev libgl1-mesa-dev mesa-utils ffmpeg
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Set up MSVC (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # --- build: the actual contract ----------------------------------------
+      - name: Build (macOS / CGL)
+        if: runner.os == 'macOS'
+        run: clang -O2 -Wall -Wextra -o render_glsl src/render_glsl.c -framework OpenGL
+
+      - name: Build (Linux / EGL)
+        if: runner.os == 'Linux'
+        run: cc -O2 -Wall -Wextra -D_GNU_SOURCE -o render_glsl src/render_glsl.c -lEGL -lGL
+
+      - name: Build (Windows / WGL)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: cl /nologo /O2 /W3 /Fe:render_glsl.exe src\render_glsl.c opengl32.lib gdi32.lib user32.lib
+
+      # --- smoke render: best effort ----------------------------------------
+      - name: ffmpeg present?
+        shell: bash
+        run: ffmpeg -version | head -1
+
+      - name: Smoke render (640x360 @ 30fps, 1 s)
+        continue-on-error: true
+        shell: bash
+        env:
+          # no GPU on the runners: force Mesa's software rasteriser
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          case "${{ runner.os }}" in
+            Windows) BIN=./render_glsl.exe ;;
+            *)       BIN=./render_glsl ;;
+          esac
+          mkdir -p smoke
+          if "$BIN" smoke/wave.mp4 640 360 30 1; then
+            echo "render: OK"
+          else
+            echo "render: FAILED (acceptable on a GPU-less runner; the build step is the contract)"
+            exit 1
+          fi
+          ffprobe -v error -select_streams v:0 \
+            -show_entries stream=codec_name,width,height,nb_frames \
+            -show_entries format=duration -of default=nw=1 smoke/wave.mp4
+
+      - name: Upload smoke video
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-${{ matrix.os }}
+          path: smoke/
+          if-no-files-found: ignore
